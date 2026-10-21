@@ -177,7 +177,16 @@ test('the persisted choice triggers a debounced auto-detection for both agents',
   // changes, in the CLI mode (built-in vs external) it is configured for.
   assert.match(sectionSource, /for \(const \[cliAgent, cliPath\] of currentPaths\)/);
   assert.match(sectionSource, /for \(const \[cliAgent, cliPath, useBuiltin\] of currentPaths\)/);
-  assert.match(sectionSource, /void detect\(cliAgent, cliPath, useBuiltin\)/);
+  // Automatic detection stays silent; the manual detect button wraps it in
+  // detectAndNotify, which toasts the outcome like the models settings'
+  // connection test.
+  assert.match(sectionSource, /detect\(cliAgent, cliPath, useBuiltin\)/);
+  assert.match(sectionSource, /void detectAndNotify\(cliAgent, cliPath, useBuiltin\)/);
+  assert.match(sectionSource, /void detectAndNotify\(cliAgent, draftValues\[cliPathKey\] \|\| ''\)/);
+  assert.match(sectionSource, /result\?\.status === 'ok' \|\| result\?\.status === 'warning'/);
+  assert.match(sectionSource, /showHint\(t\('config\.externalCli\.savedHint'\)\)/);
+  assert.match(sectionSource, /showHint\(t\('config\.externalCli\.detectSucceeded'\)\)/);
+  assert.match(sectionSource, /data-testid="settings-external-cli-toast"/);
   assert.match(sectionSource, /detectRequestIdsRef\.current\[cliAgent\] !== requestId/);
 });
 
@@ -187,8 +196,8 @@ test('saving an edited path validates it with a throwaway detect before committi
     'utf8',
   );
 
-  assert.match(sectionSource, /const probe = await onDetect\(cliAgent, requestedPath, false\)/);
-  assert.match(sectionSource, /if \(probe\.status !== 'ok' && probe\.status !== 'warning'\)/);
+  assert.match(sectionSource, /const probe = await detect\(cliAgent, requestedPath, false\)/);
+  assert.match(sectionSource, /if \(!probe \|\| \(probe\.status !== 'ok' && probe\.status !== 'warning'\)\)/);
   assert.match(
     sectionSource,
     /await commit\(cliAgent, \{ enabled: true, useBuiltin: false, cliPath: requestedPath \}\)/,
@@ -235,9 +244,45 @@ test('re-detecting keeps the card layout stable instead of unmounting the path b
   // block and install button during probes, collapsing and regrowing the card
   // (the whole settings page shook on every 检测 click).
   assert.match(sectionSource, /const installed = isInstalledStatus\(result\);/);
-  // The install button stays mounted and is merely disabled while detecting.
+  // Controls stay mounted and are merely disabled while detecting. Detect and
+  // install disable independently: detect is a read-only probe, so it stays
+  // usable while the agent's own install runs — only the install button
+  // freezes then (a re-click would fire a duplicate force install).
   assert.doesNotMatch(sectionSource, /\{!detectingNow \? \(/);
-  assert.match(sectionSource, /disabled=\{disabled \|\| !onCommitAgent \|\| detectingNow\}/);
+  assert.match(sectionSource, /disabled=\{disabled \|\| !onDetect \|\| editing\[cliAgent\]\}/);
+  assert.doesNotMatch(sectionSource, /!onDetect \|\| agentInstalling/);
+  // Symmetrically, a running detect must not freeze the install entries:
+  // the two actions are independent read-only/probe vs. commit operations.
+  assert.doesNotMatch(sectionSource, /!onCommitAgent \|\| detectingNow/);
+});
+
+test('installed cards keep the detect+install pair and not-installed ones show the hint', () => {
+  const sectionSource = readFileSync(
+    new URL('../src/components/ExternalCliAgentsSection.tsx', import.meta.url),
+    'utf8',
+  );
+
+  // One-click install lives in two mutually exclusive places: the path-row
+  // button pair (installed card) and the not-installed hint banner. The
+  // banner hides only while a detect is in flight with a result on screen,
+  // so a manual re-detect never flashes it — once the detect finishes the
+  // banner follows the real result.
+  const installBtnMatches = sectionSource.match(/settings-panel-external-cli-agent-install-btn/g) ?? [];
+  assert.equal(installBtnMatches.length, 2);
+  assert.match(sectionSource, /installNow\(cliAgent\)/);
+  // A force install on an already-installed agent finishes silently backend-side,
+  // so installNow must always toast the outcome to stay responsive.
+  assert.match(sectionSource, /showHint\(t\('config\.externalCli\.installSucceeded'\)\)/);
+  assert.match(sectionSource, /!installed && enabled && \(!result \|\| !detectingNow\)/);
+  assert.doesNotMatch(sectionSource, /manualDetectAgents/);
+  // Built-in mode shows the actual built-in CLI path from detection instead of
+  // the generic placeholder text.
+  assert.match(sectionSource, /useBuiltin && detectedPath \? \(/);
+  // MRU history entries carry a per-option remove button; the active path and
+  // the detected PATH lookup must stay non-removable.
+  assert.match(sectionSource, /for \(const path of \[cliPath, detectedPath\]\) pushPathOption\(path, false\);/);
+  assert.match(sectionSource, /for \(const path of pathHistories\[cliAgent\] \?\? \[\]\) pushPathOption\(path, true\);/);
+  assert.match(sectionSource, /const removePathHistory = useCallback/);
 });
 
 test('install-now bypasses the no-change short circuit so a deleted built-in CLI can be repaired', () => {
@@ -283,9 +328,25 @@ test('an existing directory is reported as an invalid CLI executable path', () =
 test('the detection hint distinguishes PATH lookup from executable validation', () => {
   const zhLocale = readFileSync(new URL('../src/i18n/locales/zh.json', import.meta.url), 'utf8');
   const enLocale = readFileSync(new URL('../src/i18n/locales/en.json', import.meta.url), 'utf8');
+  const section = readFileSync(
+    new URL('../src/components/ExternalCliAgentsSection.tsx', import.meta.url),
+    'utf8',
+  );
 
-  assert.match(zhLocale, /"detectHint": "未填写路径时从系统 PATH 查找；填写路径后检测指定的 CLI 可执行文件/);
-  assert.match(enLocale, /"detectHint": "Leave the path empty to search the system PATH/);
+  assert.match(zhLocale, /"detectHint": "检测 CLI 可执行文件并校验版本；未填写路径时从系统 PATH 查找"/);
+  assert.match(enLocale, /"detectHint": "Validate the CLI executable and check its version/);
+  // Saved paths are mandatory (an empty path cannot pass save validation), so
+  // the installed-card detect button uses a dedicated hint without the PATH
+  // fallback wording, and editing a path freezes the sibling controls.
+  assert.match(zhLocale, /"redetectHint": "重新检测当前 CLI 可执行文件并校验版本"/);
+  assert.match(enLocale, /"redetectHint": "Re-check the current CLI executable and validate its version"/);
+  assert.match(section, /title=\{t\('config\.externalCli\.redetectHint'\)\}/);
+  assert.match(section, /disabled=\{disabled \|\| !onDetect \|\| editing\[cliAgent\]\}/);
+  assert.match(section, /!onCommitAgent \|\| agentInstalling \|\| editing\[cliAgent\]/);
+  // The enable switch must stay clickable even when the CLI is reported
+  // missing (e.g. right after a page reload, before the auto-detect runs),
+  // otherwise the user gets locked out of re-enabling a disabled agent.
+  assert.match(section, /disabled=\{disabled \|\| committing\[cliAgent\] \|\| agentInstalling \|\| editing\[cliAgent\]\}/);
 });
 
 test('uploaded custom agents are listed after Claude and Codex', async () => {

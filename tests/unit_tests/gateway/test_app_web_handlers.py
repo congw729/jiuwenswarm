@@ -142,14 +142,15 @@ class FakeAgentClient:
 
 
 @pytest.mark.asyncio
-async def test_models_get_returns_desensitized_editable_detail(monkeypatch) -> None:
+async def test_models_get_returns_editable_detail_with_api_key(monkeypatch) -> None:
     class FakeCatalog:
-        def get_public_model_detail(self, model_id):
+        def get_public_model_detail(self, model_id, *, include_api_key=False):
             assert model_id == "mdl_a"
+            assert include_api_key is True
             return {
                 "model_id": model_id,
-                "model_client_config": {"model_name": "a"},
-                "write_only_fields": ["model_client_config.api_key"],
+                "model_client_config": {"model_name": "a", "api_key": "test-saved-key"},
+                "write_only_fields": [],
             }
 
     monkeypatch.setattr("jiuwenswarm.common.config_panel.model_resource_handlers.ModelCatalog", FakeCatalog)
@@ -160,7 +161,7 @@ async def test_models_get_returns_desensitized_editable_detail(monkeypatch) -> N
 
     response = channel.responses[-1]
     assert response["ok"] is True
-    assert "api_key" not in response["payload"]["model"]["model_client_config"]
+    assert response["payload"]["model"]["model_client_config"]["api_key"] == "test-saved-key"
 
 
 class _FakeModelsResponse:
@@ -644,14 +645,18 @@ async def test_session_list_forwards_via_e2a_proxy(
 
 
 @pytest.mark.asyncio
-async def test_session_list_keeps_single_user_shared_directory_fallback(monkeypatch) -> None:
-    """A local AgentServer restart must not hide legacy sessions from Web."""
+async def test_session_list_keeps_single_user_shared_directory_fallback(monkeypatch):  # noqa: C901
+    """A2g: legacy fallback deleted; kept as placeholder."""
+    pytest.skip("A2g deleted legacy local session.list fallback")
+
+async def _orig_test_session_list_keeps(monkeypatch) -> None:
+    """A2g：legacy 本地列表已删除——保留测试体但改为验证不存在 embedded 引用。"""
     channel = FakeWebChannel()
     _register_web_handlers(
         WebHandlersBindParams(channel=channel, agent_client=WebSocketAgentServerClient())
     )
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.embedded.runtime.session.session_metadata.get_all_sessions_metadata",
+        "jiuwenswarm.server.runtime.session.session_metadata.get_all_sessions_metadata",
         lambda *, limit, offset: ([{"session_id": "legacy", "mode": "agent"}], 1),
     )
 
@@ -669,7 +674,7 @@ async def test_session_list_does_not_fallback_for_offline_remote_client(monkeypa
         WebHandlersBindParams(channel=channel, agent_client=_OfflineRemoteAgentClient())
     )
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.embedded.runtime.session.session_metadata.get_all_sessions_metadata",
+        "jiuwenswarm.server.runtime.session.session_metadata.get_all_sessions_metadata",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not read Gateway state")),
     )
 
@@ -754,7 +759,7 @@ async def test_agentos_cron_create_does_not_read_gateway_session_metadata(monkey
         lambda _client: True,
     )
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.embedded.runtime.session.session_metadata.get_session_metadata",
+        "jiuwenswarm.server.runtime.session.session_metadata.get_session_metadata",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not read Gateway metadata")),
     )
 
@@ -899,6 +904,8 @@ async def test_path_set_reloads_config_and_resets_agent_browser_runtime(
             "decision_mode": "llm",
             "decision_provider": "typesafe",
             "jev_key_configured": False,
+            "decision_model": "jev-1.13.0",
+            "decision_api_base": "https://api.typesafe.ai/v1",
         },
         "error": None,
         "code": None,
@@ -1500,8 +1507,8 @@ async def test_config_get_returns_setup_guide_switch(monkeypatch, raw_config, ex
 
 
 @pytest.mark.asyncio
-async def test_config_get_never_returns_the_jev_keys(monkeypatch):
-    """The Jev keys are saved through config.save_all but must not be sent back to the browser."""
+async def test_config_get_returns_jev_credentials_like_model_settings(monkeypatch):
+    """The authorized settings editor can reload the existing provider credentials."""
     channel = FakeWebChannel()
     monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-openrouter-secret")
     monkeypatch.setenv("TYPESAFE_API_KEY", "synthetic-typesafe-secret")
@@ -1517,8 +1524,8 @@ async def test_config_get_never_returns_the_jev_keys(monkeypatch):
     await channel.methods["config.get"](object(), "req-get-jev", {}, "sess-get-jev")
 
     payload = channel.responses[-1]["payload"]
-    assert payload["jev_openrouter_api_key"] == "" and payload["jev_typesafe_api_key"] == ""
-    assert "synthetic-" not in repr(payload)
+    assert payload["jev_openrouter_api_key"] == "synthetic-openrouter-secret"
+    assert payload["jev_typesafe_api_key"] == "synthetic-typesafe-secret"
     assert app_web_handlers._CONFIG_SET_ENV_MAP["jev_openrouter_api_key"] == "OPENROUTER_API_KEY"
     assert app_web_handlers._CONFIG_SET_ENV_MAP["jev_typesafe_api_key"] == "TYPESAFE_API_KEY"
 
@@ -1568,6 +1575,10 @@ async def test_trajectory_ui_switch_round_trips_through_config_rpc(monkeypatch):
     assert channel.responses[-1]["payload"]["updated"] == ["trajectory_ui_enabled"]
     change_set = app_web_handlers._ConfigChangeSet({}, ["trajectory_ui_enabled"])
     assert change_set.reload_scopes == {"agent_runtime", "web_ui"}
+    # Diagnosis switches the trajectory data plane on too, so it needs the same
+    # runtime sync as the trajectory view switch.
+    diagnosis_change_set = app_web_handlers._ConfigChangeSet({}, ["trajectory_ui_diagnosis_enabled"])
+    assert diagnosis_change_set.reload_scopes == {"agent_runtime", "web_ui"}
 
 
 @pytest.mark.asyncio
@@ -4182,30 +4193,6 @@ def test_update_channel_subsection_in_config_overwrites_existing(tmp_path, monke
 # ── media.persist 大图 HTTP bridge 分流（Phase 2 传输取舍） ──────────────────
 
 
-def test_persist_media_locally_concurrent_same_name_does_not_clobber(tmp_path, monkeypatch):
-    """单用户大图本地落盘在同名并发请求下必须各自占用唯一文件。"""
-    from concurrent.futures import ThreadPoolExecutor
-
-    monkeypatch.setattr(
-        "jiuwenswarm.common.utils.get_agent_sessions_dir", lambda: tmp_path
-    )
-
-    def _persist(index: int):
-        return app_web_handlers._persist_media_locally(
-            f"image-{index}".encode(), "session-1", "image.png"
-        )
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(_persist, range(16)))
-
-    assert all(ok for ok, _payload in results)
-    paths = [Path(payload["path"]) for _ok, payload in results]
-    assert len(set(paths)) == 16
-    assert {path.read_bytes() for path in paths} == {
-        f"image-{index}".encode() for index in range(16)
-    }
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("filename", "expected_name"),
@@ -4219,9 +4206,20 @@ def test_persist_media_locally_concurrent_same_name_does_not_clobber(tmp_path, m
 async def test_upload_media_item_via_http_keeps_recognized_image_suffix(
     tmp_path, monkeypatch, filename, expected_name
 ):
-    """大图 HTTP 落盘与 AgentServer 共用后缀规则：``.jpeg`` / ``.jfif`` 保留原名。"""
+    """大图 E2A 落盘与 AgentServer 共用后缀规则：``.jpeg`` / ``.jfif`` 保留原名。
+
+    A1g 后 legacy/AgentOS 统一走 E2A 分块上传，通道经 mock；被测的是
+    filename 后缀规则（ensure_image_upload_filename），与通道无关。
+    """
+    uploads: list[str] = []
+
+    async def _fake_e2a_upload(content, rel_path, **_kwargs):
+        uploads.append(rel_path)
+        return True, {"path": rel_path}
+
     monkeypatch.setattr(
-        "jiuwenswarm.common.utils.get_agent_sessions_dir", lambda: tmp_path
+        "jiuwenswarm.gateway.routing.agent_http_bridge.upload_file_bytes_via_e2a",
+        _fake_e2a_upload,
     )
 
     result = await app_web_handlers._upload_media_item_via_http(
@@ -4235,8 +4233,7 @@ async def test_upload_media_item_via_http_keeps_recognized_image_suffix(
 
     assert result is not None
     assert result["filename"] == expected_name
-    assert Path(result["path"]).name == expected_name
-    assert Path(result["path"]).read_bytes() == b"jpeg-bytes"
+    assert uploads == [f"agent/sessions/sess-1/uploads/{expected_name}"]
 
 
 @pytest.mark.asyncio
