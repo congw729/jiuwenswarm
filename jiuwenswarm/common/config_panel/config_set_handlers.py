@@ -73,10 +73,21 @@ from jiuwenswarm.common.config import (
     update_task_asr_in_config,
     update_team_scheduled_dispatch_in_config,
     update_team_task_verification_in_config,
+    update_trajectory_diagnosis_in_config,
     update_trajectory_ui_in_config,
     update_default_models_in_config,
     update_login_model_settings_in_config,
     validate_persisted_kv_cache_affinity,
+)
+from jiuwenswarm.common.config_panel.external_cli_read import (
+    EXTERNAL_CLI_AGENT_KEY_SUFFIXES,
+    EXTERNAL_CLI_AGENT_KINDS,
+    EXTERNAL_CLI_CUSTOM_AGENTS_KEY,
+    _uploaded_cli_path,
+    custom_agents_config_value,
+    external_cli_agent_key,
+    external_cli_agent_kinds,
+    flatten_external_cli_agents_for_config_panel,
 )
 from jiuwenswarm.common.config_panel.models_handlers import (
     ConfigPanelBadRequest,
@@ -120,8 +131,6 @@ class ConfigPanelInternalError(RuntimeError):
 # 热更新 scope 常量与变更集（自 app_web_handlers 迁出）
 # --------------------------------------------------------------------------- #
 WEB_CONFIG_RELOAD_CHANNEL_ID = "web"
-# Saved through config.save_all but never sent back to clients.
-WRITE_ONLY_CONFIG_KEYS = frozenset({"jev_openrouter_api_key", "jev_typesafe_api_key"})
 SEARCH_RELOAD_ENV_KEYS = {
     "BOCHA_API_KEY", "PERPLEXITY_API_KEY", "SERPER_API_KEY", "JINA_API_KEY",
 }
@@ -216,7 +225,9 @@ class ConfigChangeSet:
                 scopes.add("proactive")
             elif key_text.startswith("symphony") or key_text.startswith("skill_retrieval"):
                 scopes.add("agent_runtime")
-            elif key_text == "trajectory_ui_enabled":
+            elif key_text in {"trajectory_ui_enabled", "trajectory_ui_diagnosis_enabled"}:
+                # Diagnosis switches the trajectory data plane on as well, so
+                # it needs the same runtime sync as the trajectory view switch.
                 scopes.update({"agent_runtime", "web_ui"})
             elif key_text in {"task_full_duplex_enabled", "team_organization_ui_enabled"}:
                 scopes.add("web_ui")
@@ -327,6 +338,7 @@ CONFIG_SET_ENV_MAP = {
     "perplexity_api_key": "PERPLEXITY_API_KEY",
     "jev_openrouter_api_key": "OPENROUTER_API_KEY",
     "jev_typesafe_api_key": "TYPESAFE_API_KEY",
+    "jev_custom_api_key": "JEV_CUSTOM_API_KEY",
     "github_token": "GITHUB_TOKEN",
     "teamskills_market_url": "TEAM_SKILLS_HUB_BASE_URL",
     "teamskills_user_token": "TEAM_SKILLS_HUB_USER_TOKEN",
@@ -368,6 +380,7 @@ CONFIG_YAML_KEYS = frozenset({
     "a2ui_enabled",
     "rsi_enabled",
     "trajectory_ui_enabled",
+    "trajectory_ui_diagnosis_enabled",
     "task_full_duplex_enabled",
     "team_organization_ui_enabled",
     "task_asr_enabled",
@@ -402,9 +415,6 @@ EXTERNAL_CLI_AGENT_CONFIG_KEYS = frozenset({
     "external_cli_agent_codex_use_builtin",
     "external_cli_agent_codex_cli_path",
 })
-EXTERNAL_CLI_AGENT_KINDS = ("claude", "codex")
-EXTERNAL_CLI_AGENT_KEY_SUFFIXES = ("enabled", "use_builtin", "cli_path")
-EXTERNAL_CLI_CUSTOM_AGENTS_KEY = "external_cli_custom_agents"
 DEFAULT_EXTERNAL_CLI_PUBLISH_HOST = "127.0.0.1"
 DEFAULT_EXTERNAL_CLI_PUBLISH_PORT = "19000"
 EXTERNAL_CLI_PUBLISH_PATH = "/ws"
@@ -593,13 +603,6 @@ def flatten_team_dispatch_for_config_panel(raw: dict[str, Any]) -> dict[str, str
     }
 
 
-def external_cli_agent_kinds() -> tuple[str, ...]:
-    """Return Claude, Codex and every installed custom agent."""
-    from jiuwenswarm.common.custom_agent_runtime import custom_agent_names
-
-    return (*EXTERNAL_CLI_AGENT_KINDS, *custom_agent_names())
-
-
 def custom_external_cli_config_keys() -> tuple[str, ...]:
     """Return the settings keys of the installed custom agents."""
     from jiuwenswarm.common.custom_agent_runtime import custom_agent_names
@@ -611,63 +614,9 @@ def custom_external_cli_config_keys() -> tuple[str, ...]:
     )
 
 
-def custom_agents_config_value() -> str:
-    """Describe the installed custom agents for the settings panel, as a JSON string.
-
-    Config values travel as strings; each item carries ``name`` / ``version`` /
-    ``summary`` / ``has_cli`` (whether a CLI executable was uploaded with it).
-    """
-    from jiuwenswarm.common.custom_agent_runtime import list_custom_agents
-
-    return json.dumps(
-        [
-            {"name": agent.name, "version": agent.version, "summary": agent.summary, "has_cli": bool(agent.cli_path)}
-            for agent in list_custom_agents()
-        ],
-        ensure_ascii=False,
-    )
-
-
 def is_external_cli_agent_config_key(key: str) -> bool:
     """Return whether ``key`` is a settings key of a built-in or custom agent."""
     return key in EXTERNAL_CLI_AGENT_CONFIG_KEYS or key in custom_external_cli_config_keys()
-
-
-def _uploaded_cli_path(cli_agent: str) -> str:
-    """Return the CLI executable uploaded with custom agent ``cli_agent``, if any."""
-    if cli_agent in EXTERNAL_CLI_AGENT_KINDS:
-        return ""
-    from jiuwenswarm.common.custom_agent_runtime import get_custom_agent
-
-    agent = get_custom_agent(cli_agent)
-    return agent.cli_path if agent is not None else ""
-
-
-def flatten_external_cli_agents_for_config_panel(raw: dict[str, Any]) -> dict[str, str]:
-    agents = get_nested_config_value(raw, EXTERNAL_CLI_AGENTS_CONFIG_PATH, [])
-    configured: dict[str, dict[str, str]] = {}
-    if isinstance(agents, list):
-        for item in agents:
-            if isinstance(item, str):
-                cli_agent = item.strip()
-                cli_path = ""
-            elif isinstance(item, dict):
-                cli_agent = str(item.get("cli_agent") or "").strip()
-                cli_path = str(item.get("cli_path") or item.get("codex_bin") or "").strip()
-            else:
-                continue
-            if cli_agent:
-                configured[cli_agent] = {"cli_path": cli_path}
-    flat: dict[str, str] = {}
-    for cli_agent in external_cli_agent_kinds():
-        entry = configured.get(cli_agent)
-        cli_path = entry.get("cli_path", "") if entry is not None else ""
-        # A custom agent running its uploaded CLI uses the "built-in CLI" choice.
-        builtin = entry is not None and cli_path in {"", _uploaded_cli_path(cli_agent)}
-        flat[external_cli_agent_key(cli_agent, "enabled")] = "true" if entry is not None else "false"
-        flat[external_cli_agent_key(cli_agent, "use_builtin")] = "true" if builtin else "false"
-        flat[external_cli_agent_key(cli_agent, "cli_path")] = "" if builtin else cli_path
-    return flat
 
 
 def parse_config_switch_bool(value: Any) -> bool:
@@ -1086,10 +1035,6 @@ def inject_external_cli_publish_url(params: dict[str, Any]) -> dict[str, Any]:
     return {**params, "team": teams}
 
 
-def external_cli_agent_key(cli_agent: str, suffix: str) -> str:
-    return f"external_cli_agent_{cli_agent}_{suffix}"
-
-
 def external_cli_agent_effective_state(
     cli_agent: str,
     current: dict[str, str],
@@ -1494,6 +1439,8 @@ def apply_config_payload(
                 update_a2ui_in_config(update)
             elif param_key == "trajectory_ui_enabled":
                 update_trajectory_ui_in_config(parsed)
+            elif param_key == "trajectory_ui_diagnosis_enabled":
+                update_trajectory_diagnosis_in_config(parsed)
             elif param_key == "task_full_duplex_enabled":
                 update_task_full_duplex_in_config(parsed)
             elif param_key == "team_organization_ui_enabled":
@@ -1665,7 +1612,7 @@ async def config_get_handler(
 ) -> None:
     """返回 CONFIG_SET_ENV_MAP 里所有键对应的环境变量当前值（Web 契约）。"""
     payload = {
-        param_key: "" if param_key in WRITE_ONLY_CONFIG_KEYS else (os.getenv(env_key) or "")
+        param_key: os.getenv(env_key) or ""
         for param_key, env_key in CONFIG_SET_ENV_MAP.items()
     }
     payload["app_version"] = get_runtime_version()
@@ -1708,6 +1655,9 @@ async def config_get_handler(
         trajectory_cfg = raw.get("trajectory_ui") or {}
         payload["trajectory_ui_enabled"] = (
             "true" if trajectory_cfg.get("enabled", False) else "false"
+        )
+        payload["trajectory_ui_diagnosis_enabled"] = (
+            "true" if trajectory_cfg.get("diagnosis_enabled", False) else "false"
         )
         experimental_cfg = raw.get("experimental") or {}
         payload["team_organization_ui_enabled"] = (
@@ -1761,6 +1711,7 @@ async def config_get_handler(
         for key, value in provider("a2ui").get_default_a2ui_config_payload().items():
             payload.setdefault(key, value)
         payload.setdefault("trajectory_ui_enabled", "false")
+        payload.setdefault("trajectory_ui_diagnosis_enabled", "false")
         payload.setdefault("task_full_duplex_enabled", "false")
         payload.setdefault("team_organization_ui_enabled", "false")
         payload.setdefault("task_asr_enabled", "false")

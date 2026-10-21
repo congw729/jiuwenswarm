@@ -35,6 +35,7 @@ const FRONTEND_ONLY_BACKEND_PORT = 19000;
 const CDP_TARGET_TIMEOUT_MS = 10_000;
 const BROWSER_VIEW_MAX_CRASHES = 5;
 const SERVICE_SHUTDOWN_TIMEOUT_MS = 5_000;
+const RUNTIME_SHUTDOWN_TIMEOUT_MS = 30_000;
 const SERVICE_KILL_TIMEOUT_MS = 1_500;
 const DEFAULT_BROWSER_URL = 'https://cn.bing.com/';
 const PLAYWRIGHT_MCP_PACKAGE = '@playwright/mcp@0.0.78';
@@ -252,7 +253,7 @@ function logStreamFor(name) {
 
 function serviceCommand(name, extraArgs = []) {
   if (app.isPackaged) {
-    const flags = { web: '--desktop-run-web', agent: '--desktop-run-agent', gateway: '--desktop-run-gateway' };
+    const flags = { web: '--desktop-run-web', agent: '--desktop-run-agent', gateway: '--desktop-run-gateway', lifecycle: '--desktop-run-worker-lifecycle' };
     const flag = flags[name];
     if (!flag) throw new Error(`Unknown service name: ${name}`);
     return { command: backendExecutable(), args: [flag, ...extraArgs] };
@@ -266,6 +267,7 @@ function serviceCommand(name, extraArgs = []) {
     agent: 'jiuwenswarm.server.app_agentserver',
     gateway: 'jiuwenswarm.gateway.app_gateway',
     web: 'jiuwenswarm.channels.web.app_web',
+    lifecycle: 'jiuwenswarm.server.supervisor.shutdown',
   };
   const moduleName = moduleNames[name];
   if (!moduleName) throw new Error(`Unknown service name: ${name}`);
@@ -372,6 +374,7 @@ function spawnService(name, ports, extraArgs = []) {
     windowsHide: !isViteDev,
     shell: false,
   });
+  child.spawnEnvironment = env;
   serviceProcesses.set(name, child);
   child.once('exit', (code, signal) => {
     if (!shuttingDown) {
@@ -757,6 +760,13 @@ function signalServiceTree(child, signal) {
   if (!child?.pid) return false;
   try {
     if (process.platform === 'win32') {
+      if (serviceProcesses.get('agent') === child) {
+        const { command, args } = serviceCommand('lifecycle', ['--detach-front', String(child.pid)]);
+        const helper = spawn(command, args, { windowsHide: true, stdio: 'ignore', cwd: serviceWorkingDirectory(), env: child.spawnEnvironment || process.env });
+        helper.on('error', error => console.error('[electron] Front detach helper failed', error));
+        helper.unref();
+        return true;
+      }
       const taskkill = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
         windowsHide: true,
         stdio: 'ignore',
@@ -822,9 +832,21 @@ function stopServices() {
   for (const [name, child] of services) {
     console.log(`[electron] stopping ${name} service tree`, { pid: child.pid });
   }
-  shutdownPromise = Promise.allSettled(services.map(([, child]) => terminateService(child))).then(results => {
+  const deadline = Date.now() + RUNTIME_SHUTDOWN_TIMEOUT_MS;
+  shutdownPromise = Promise.allSettled(services.map(([, child]) => terminateService(child))).then(async results => {
     for (const result of results) {
       if (result.status === 'rejected') console.error('[electron] service shutdown failed', result.reason);
+    }
+    if (services.some(([name]) => name === 'agent')) {
+      const remaining = Math.max(1, deadline - Date.now());
+      const { command, args } = serviceCommand('lifecycle', ['--shutdown-worker', '--timeout', String(remaining / 1000)]);
+      const agent = services.find(([name]) => name === 'agent')[1];
+      await new Promise(resolve => {
+        const helper = spawn(command, args, { windowsHide: true, stdio: 'inherit', cwd: serviceWorkingDirectory(), env: agent.spawnEnvironment || process.env });
+        const timer = setTimeout(() => { console.error('[electron] Worker shutdown helper exceeded deadline'); helper.kill(); resolve(); }, remaining + 500);
+        helper.once('error', error => { clearTimeout(timer); console.error('[electron] Worker shutdown failed', error); resolve(); });
+        helper.once('exit', code => { clearTimeout(timer); if (code !== 0) console.error('[electron] Worker shutdown incomplete', { code }); resolve(); });
+      });
     }
     serviceProcesses.clear();
   });
@@ -1701,10 +1723,32 @@ async function uniqueDownloadPath(filename) {
   }
 }
 
+/** Decode a browser FileReader-style data URL into bytes for local save. */
+function decodeDownloadDataUrl(dataUrl) {
+  const raw = String(dataUrl);
+  if (!raw.startsWith('data:')) throw new Error('Unsupported download protocol: data-url');
+  const comma = raw.indexOf(',');
+  if (comma < 0) throw new Error('Invalid data URL');
+  const metadata = raw.slice(5, comma);
+  const payload = raw.slice(comma + 1);
+  const isBase64 = /(?:^|;)base64$/i.test(metadata);
+  if (isBase64) return Buffer.from(payload, 'base64');
+  return Buffer.from(decodeURIComponent(payload), 'utf8');
+}
+
 async function saveDownloadedFile(url, filename) {
-  const targetUrl = new URL(String(url), currentFrontendUrl);
-  if (targetUrl.protocol !== 'http:' && targetUrl.protocol !== 'https:') {
-    throw new Error(`Unsupported download protocol: ${targetUrl.protocol}`);
+  // File-preview text downloads (e.g. manifest.json) pass a data: URL from the
+  // renderer. Accept those locally; keep rejecting other non-http(s) schemes.
+  const rawUrl = String(url);
+  let inlineBytes = null;
+  let targetUrl = null;
+  if (rawUrl.startsWith('data:')) {
+    inlineBytes = decodeDownloadDataUrl(rawUrl);
+  } else {
+    targetUrl = new URL(rawUrl, currentFrontendUrl);
+    if (targetUrl.protocol !== 'http:' && targetUrl.protocol !== 'https:') {
+      throw new Error(`Unsupported download protocol: ${targetUrl.protocol}`);
+    }
   }
   const result = await dialog.showSaveDialog(mainWindow, {
     defaultPath: path.join(app.getPath('downloads'), sanitizeFilename(filename)),
@@ -1714,12 +1758,24 @@ async function saveDownloadedFile(url, filename) {
   const temporaryPath = path.join(path.dirname(targetPath), `.${path.basename(targetPath)}.${randomUUID()}.part`);
   let temporaryCreated = false;
   try {
-    const response = await net.fetch(targetUrl);
-    if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}`);
-    if (!response.body) throw new Error('Download response has no body');
-    const handle = await fs.open(temporaryPath, 'wx');
-    temporaryCreated = true;
-    await pipeline(Readable.fromWeb(response.body), handle.createWriteStream());
+    if (inlineBytes) {
+      // Mark created as soon as the exclusive create succeeds so a mid-write
+      // failure (e.g. ENOSPC) still removes the leftover .part in finally.
+      const handle = await fs.open(temporaryPath, 'wx');
+      temporaryCreated = true;
+      try {
+        await handle.writeFile(inlineBytes);
+      } finally {
+        await handle.close().catch(() => {});
+      }
+    } else {
+      const response = await net.fetch(targetUrl);
+      if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}`);
+      if (!response.body) throw new Error('Download response has no body');
+      const handle = await fs.open(temporaryPath, 'wx');
+      temporaryCreated = true;
+      await pipeline(Readable.fromWeb(response.body), handle.createWriteStream());
+    }
     await fs.rename(temporaryPath, targetPath);
     temporaryCreated = false;
   } finally {
@@ -1758,6 +1814,10 @@ const BLOB_EXPORT_SPECS = {
   'image/svg+xml': { suffixes: ['.svg'], parameters: ['charset=utf-8'], filter: { name: 'SVG Image', extensions: ['svg'] } },
   'text/plain': { suffixes: ['.mmd'], parameters: ['charset=utf-8'], filter: { name: 'Mermaid Diagram', extensions: ['mmd'] } },
   'application/json': { suffixes: ['.json'], parameters: ['charset=utf-8'], filter: { name: 'JSON Archive', extensions: ['json'] } },
+  // Trajectory panel exports (.trajectory.zip / .trajectory.jsonl). Keep in sync
+  // with DATA_URL_EXPORT_SPECS in desktop_app.py (contract test enforces this).
+  'application/zip': { suffixes: ['.zip'], parameters: [], filter: { name: 'ZIP Archive', extensions: ['zip'] } },
+  'application/jsonl': { suffixes: ['.jsonl'], parameters: ['charset=utf-8'], filter: { name: 'JSONL Archive', extensions: ['jsonl'] } },
 };
 const BASE64_CHUNK_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 const blobSaveTransfers = new Map();

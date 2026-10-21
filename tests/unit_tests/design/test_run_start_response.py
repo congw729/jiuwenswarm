@@ -70,3 +70,45 @@ async def test_start_reports_failure_before_initial_snapshot(monkeypatch):
     await asyncio.gather(*list(adapter._RUN_TASKS))
     assert response.ok is False
     assert "cannot prepare trigger" in str(response.payload)
+
+
+@pytest.mark.parametrize("warmup_fails", [False, True])
+async def test_start_warms_context_before_trigger(monkeypatch, warmup_fails):
+    from jiuwenswarm.server.runtime.design import team_bridge
+
+    graph = {"graph_id": "g_cold", "metadata": {"session_id": "design_cold"}}
+    snapshot = {"run_id": "run_cold", "graph_id": "g_cold", "status": "running"}
+    calls = []
+
+    async def warm_context(received_graph):
+        assert received_graph == graph
+        calls.append("warm")
+        if warmup_fails:
+            raise RuntimeError("warm-up unavailable")
+
+    async def start(received_graph, *, node_ids, cascade, on_update):
+        assert received_graph == graph
+        assert calls == ["warm"]
+        calls.append("start")
+        on_update(snapshot)
+        return snapshot
+
+    async def push(**kwargs):
+        pass
+
+    monkeypatch.setattr(team_bridge, "ensure_design_context", warm_context)
+    monkeypatch.setattr(adapter, "_coordinator_for", lambda _: SimpleNamespace(
+        is_active=lambda: False, start=start,
+    ))
+    monkeypatch.setattr(adapter, "_start_run", lambda _: (
+        {"graph": graph, "graph_id": "g_cold", "node_ids": ["n_image"]}, None, None,
+    ))
+    monkeypatch.setattr(adapter, "_push_designer_event", push)
+    request = AgentRequest(request_id="cold", channel_id="web", session_id="design_cold",
+                           req_method=ReqMethod.DESIGNER_RUN_START)
+    response = await asyncio.wait_for(adapter.DesignerAdapter().handle(request), timeout=1)
+    await asyncio.gather(*list(adapter._RUN_TASKS))
+    await asyncio.sleep(0)
+    assert response.ok
+    assert response.payload["run"] == snapshot
+    assert calls == ["warm", "start"]

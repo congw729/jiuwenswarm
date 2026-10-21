@@ -1048,6 +1048,15 @@ def update_trajectory_ui_in_config(enabled: bool) -> None:
     dump_yaml_round_trip(CONFIG_YAML_PATH, data)
 
 
+def update_trajectory_diagnosis_in_config(enabled: bool) -> None:
+    """Update the trajectory diagnosis feature switch and persist config.yaml."""
+    data = load_yaml_round_trip(CONFIG_YAML_PATH)
+    if "trajectory_ui" not in data or data["trajectory_ui"] is None:
+        data["trajectory_ui"] = {}
+    data["trajectory_ui"]["diagnosis_enabled"] = bool(enabled)
+    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
+
+
 def update_team_organization_ui_in_config(enabled: bool) -> None:
     """Persist the experimental Organization UI switch without changing runtime capabilities."""
     data = load_yaml_round_trip(CONFIG_YAML_PATH)
@@ -1763,6 +1772,16 @@ def _merge_model_update(current: dict[str, Any], update: dict[str, Any]) -> dict
 
 def upsert_model_resource(entry: dict[str, Any]) -> dict[str, Any]:
     saved = _normalize_model_entry(entry)
+    model_config = saved.get("model_config_obj")
+    if isinstance(model_config, dict) and "reasoning_level" in model_config:
+        from jiuwenswarm.common.reasoning_config import normalize_reasoning_level
+
+        raw_level = model_config["reasoning_level"]
+        level = normalize_reasoning_level(raw_level)
+        if raw_level is not None and str(raw_level).strip() and level is None:
+            raise ValueError("Invalid reasoning_level")
+        # PyYAML reads unquoted on/off as booleans; keep the editable DTO stable.
+        model_config["reasoning_level"] = DoubleQuotedScalarString(level or "")
     saved.setdefault("model_id", _new_business_id("mdl"))
 
     def _mutate(data):
@@ -1822,29 +1841,6 @@ def _validate_model_candidate(candidate: dict[str, Any]) -> None:
     raise_if_invalid(candidate)
 
 
-def _require_unreferenced_model(
-    data: dict[str, Any], resource_type: str, resource_id: str, *, cron_references_checked: bool = False,
-) -> None:
-    from jiuwenswarm.common.model_catalog import ModelCatalog
-    from jiuwenswarm.common.model_errors import MODEL_SELECTION_REFERENCED, ModelSelectionError
-    from jiuwenswarm.common.model_selection import ModelSelection
-    from jiuwenswarm.runtime.cron.factory import load_cron_store_settings
-
-    is_etcd = load_cron_store_settings(data).backend == "etcd"
-    if is_etcd and not cron_references_checked:
-        raise ModelSelectionError(
-            MODEL_SELECTION_REFERENCED, "use the resource API to check etcd references before deletion",
-        )
-    refs = ModelCatalog(data).find_references(
-        ModelSelection(type=resource_type, id=resource_id), include_cron=not is_etcd,
-    )
-    if refs:
-        raise ModelSelectionError(
-            MODEL_SELECTION_REFERENCED, "resource is still referenced",
-            references=[ref.__dict__ for ref in refs],
-        )
-
-
 def upsert_model_group_resource(group: dict[str, Any]) -> dict[str, Any]:
     from jiuwenswarm.common.model_errors import MODEL_GROUP_INVALID, ModelSelectionError
 
@@ -1891,7 +1887,25 @@ def delete_model_resource(resource_type: str, resource_id: str, *, cron_referenc
         filtered = [entry for entry in entries if entry.get(id_key) != resource_id]
         if len(filtered) == len(entries):
             return None
-        _require_unreferenced_model(data, resource_type, resource_id, cron_references_checked=cron_references_checked)
+        if resource_type == "model":
+            # Drop routes that still point at this model so delete does not fail
+            # validation with raw mgp_/mdl_ ids in the UI (#5477). Groups left
+            # with no routes are removed.
+            next_groups = []
+            for group in candidate.get("groups") or []:
+                if not isinstance(group, dict):
+                    continue
+                routes = [
+                    route
+                    for route in (group.get("routes") or [])
+                    if not (isinstance(route, dict) and str(route.get("model_id") or "") == resource_id)
+                ]
+                if not routes:
+                    continue
+                next_group = dict(group)
+                next_group["routes"] = routes
+                next_groups.append(next_group)
+            candidate["groups"] = next_groups
         candidate[key] = filtered
         _validate_model_candidate(candidate)
         deleted = True
@@ -2004,11 +2018,6 @@ def update_default_models_in_config(
     def _mutate(data):
         if "models" not in data:
             data["models"] = {}
-        retained_ids = {entry.get("model_id") for entry in models_list}
-        for previous in data["models"].get("defaults") or []:
-            model_id = previous.get("model_id")
-            if model_id and model_id not in retained_ids:
-                _require_unreferenced_model(data, "model", model_id, cron_references_checked=cron_references_checked)
         for entry in models_list:
             if isinstance(entry, dict) and isinstance(entry.get("alias"), str):
                 entry["alias"] = DoubleQuotedScalarString(entry["alias"])
@@ -3607,7 +3616,7 @@ _DEFAULT_SANDBOX_STARTUP_MODE = "internal"
 _DEFAULT_SANDBOX_POLICY_FILE = "code-agent-policy.yaml"
 
 # YuanRong sandbox knobs under flat ``sandbox:`` (see get_sandbox_endpoint).
-_VALID_YUANRONG_EXECUTORS = ("default", "docker")
+_VALID_YUANRONG_EXECUTORS = ("default", "docker", "conch")
 _DEFAULT_YUANRONG_EXECUTOR = "docker"
 _DEFAULT_YUANRONG_URL = "http://yuanrong.local"
 _YUANRONG_ENDPOINT_OPTIONAL_KEYS: tuple[str, ...] = (
